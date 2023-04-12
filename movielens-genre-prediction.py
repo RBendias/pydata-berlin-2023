@@ -9,6 +9,7 @@
 # TODO: Improve hyperparameters
 # TODO: discuss use-case with Matthias
 # TODO: Uncomment asserts
+# TODO: Should we take the tags away
 
 # This notebook runs faster on a GPU.
 # You can enable GPU acceleration by going to Edit -> Notebook Settings -> Hardware Accelerator -> GPU
@@ -46,7 +47,7 @@ First, we download the dataset to an arbitrary folder (in this case, the current
 
 from torch_geometric.data import download_url, extract_zip
 
-dataset_name = 'ml-latest'
+dataset_name = 'ml-latest-small'
 
 url = f'https://files.grouplens.org/datasets/movielens/{dataset_name}.zip'
 extract_zip(download_url(url, '.'), '.')
@@ -135,12 +136,13 @@ movies_df['year'] = movies_df['title'].str.extract('(\(\d{4}\))', expand=False)
 movies_df['year'] = movies_df['year'].str.extract('(\d{4})', expand=False)
 
 # Remove the year and any trailing/leading whitespace from the title
-movies_df['title'] = movies_df['title'].str.replace('(\(\d{4}\))', '')
-movies_df['title'] = movies_df['title'].str.strip()
+# The title is now in the format: 'Movie Name (Year)'
+movies_df['title'] = movies_df['title'].str.replace('(\(\d{4}\))', '', regex=True)
+movies_df['title'] = movies_df['title'].apply(lambda x: x.strip())
 
 # Use a CountVectorizer to create a bag-of-words representation of the titles
 from sklearn.feature_extraction.text import CountVectorizer
-title_vectorizer = CountVectorizer(stop_words='english', analyzer='char_wb', ngram_range=(2, 2)) #, max_features=10000)
+title_vectorizer = CountVectorizer(stop_words='english', analyzer='char_wb', ngram_range=(2, 2), max_features=1000) #, max_features=10000)
 title_vectorizer.fit(movies_df['title'].iloc[train_idx]) 
 title_features = title_vectorizer.transform(movies_df['title'])
 
@@ -148,7 +150,6 @@ title_features = title_vectorizer.transform(movies_df['title'])
 year_indicator = pd.get_dummies(movies_df['year']).values
 
 import numpy as np
-
 movie_feat = np.concatenate((title_features.toarray(), year_indicator), axis=1)
 """Now, as we prepared the features based on the title and the year, we can add the tag features to the movie features as well. 
 Similar to the title, we are using a bag-of-words representation of the tags. Finally, we combine the tag features with the title and year features into a single feature matrix for every movie."""
@@ -162,13 +163,14 @@ tags_df = tags_df.groupby('movieId')['tag'].apply(
 # Merge the tags into the movies data frame
 movies_df = pd.merge(movies_df, tags_df, on='movieId', how='left')
 movies_df['tag'].fillna('', inplace=True)
-tag_vectorizer = CountVectorizer(stop_words='english', analyzer='char_wb', ngram_range=(2, 2)) #, max_features=10000)
+tag_vectorizer = CountVectorizer(stop_words='english', analyzer='char_wb', ngram_range=(2, 2), max_features=1000) #, max_features=10000)
 tag_vectorizer.fit(movies_df['tag'].iloc[train_idx])
 tag_features = tag_vectorizer.transform(movies_df['tag'])
 
 # Combine all movie features into a single feature matrix
-movie_feat = np.concatenate((movie_feat, tag_features.toarray()), axis=1)
+# movie_feat = np.concatenate((movie_feat, tag_features.toarray()), axis=1)
 movie_feat = torch.tensor(movie_feat, dtype=torch.float)
+
 """The `ratings.csv` data connects users (as given by `userId`) and movies (as given by `movieId`).
 Due to simplicity, we do not make use of the additional `timestamp` and `rating` information.
 Here, we create a mapping that maps entry IDs to a consecutive value in the range `{ 0, ..., num_rows - 1 }`.
@@ -244,6 +246,7 @@ data["movie"].x = movie_feat
 data["user", "rates", "movie"].edge_index = edge_index_user_to_movie
 data["user", "rates",
      "movie"].edge_attr = torch.from_numpy(ratings_df["rating"].to_numpy())
+data["user"].x = torch.ones((data["user"].num_nodes, 1))
 
 # We also need to make sure to add the reverse edges from movies to users
 # in order to let a GNN be able to pass messages in both directions.
@@ -280,46 +283,81 @@ data['movie'].test_mask[test_idx] = True
 assert data['movie'].train_mask.sum() == int(0.8 * data['movie'].num_nodes)
 # assert data['movie'].val_mask.sum() == int(0.1 * data['movie'].num_nodes)
 # assert data['movie'].test_mask.sum() == int(0.1 * data['movie'].num_nodes) + 1
-"""## Defining Mini-batch Loaders
 
-We are now ready to create a mini-batch loader that will generate subgraphs that can be used as input into our GNN.
-While this step is not strictly necessary for small-scale graphs, it is absolutely necessary to apply GNNs on larger graphs that do not fit onto GPU memory otherwise.
-Here, we make use of the [`loader.LinkNeighborLoader`](https://pytorch-geometric.readthedocs.io/en/latest/modules/loader.html#torch_geometric.loader.LinkNeighborLoader) which samples multiple hops from a node and creates a subgraph from it.
+"""## Baseline Model
+
+We start by defining a baseline model, which we will use to compare our heterogeneous GNN against.
+The baseline model is a simple MLP, which takes the node features of a movie as input and outputs a single value.
+"""
+from torch.nn import functional as F
+
+class Baseline(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(Baseline, self).__init__()
+        self.lin1 = torch.nn.Linear(in_channels, hidden_channels)
+        self.lin2 = torch.nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, x):
+        x = F.relu(self.lin1(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.lin2(x)
+        return x
+
+"""## Training
+
+We are now ready to train our baseline model.
 """
 
-from torch_geometric.loader import NeighborLoader
+hidden_channels = 4
+model = Baseline(data['movie'].num_features, hidden_channels, 3)
+lr = 0.001
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
-train_loader = NeighborLoader(
-    data,
-    # Sample 30 neighbors for each node and edge type for 2 iterations
-    num_neighbors={key: [30] * 2
-                   for key in data.edge_types},
-    # Use a batch size of 128 for sampling training nodes of type paper
-    batch_size=256,
-    input_nodes=('movie', data['movie'].train_mask),
-    shuffle=True,
-)
-val_loader = NeighborLoader(
-    data,
-    # Sample 30 neighbors for each node and edge type for 2 iterations
-    num_neighbors={key: [30] * 2
-                   for key in data.edge_types},
-    # Use a batch size of 128 for sampling training nodes of type paper
-    batch_size=128,
-    input_nodes=('movie', data['movie'].val_mask),
-)
+def train():
+    model.train()
+    optimizer.zero_grad()
+    logits = model(data['movie'].x)
+    loss = F.cross_entropy(logits[data['movie'].train_mask],
+                            data['movie'].y[data['movie'].train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss
 
-sampled_hetero_data = next(iter(train_loader))
-print(sampled_hetero_data['movie'].batch_size)
+def test():
+    with torch.no_grad():
+        model.eval()
+        logits = model(data['movie'].x)
+    return logits, data['movie'].y
 
-# Inspect a sample:
-sampled_data = next(iter(train_loader))
+from tqdm import tqdm
+from matplotlib import pyplot as plt
 
-print("Sampled mini-batch:")
-print("===================")
-print(sampled_data)
+pbar = tqdm(range(1, 200))
+for epoch in pbar:
+    loss = train()
+    logits, y = test()
+    y = y.argmax(dim=-1)
+    pred = logits.argmax(dim=-1)
+    train_acc = pred[data['movie'].train_mask].eq(y[data['movie'].train_mask]).sum().item() / data['movie'].train_mask.sum().item()
+    val_acc = pred[data['movie'].val_mask].eq(y[data['movie'].val_mask]).sum().item() / data['movie'].val_mask.sum().item()
+    val_loss = F.cross_entropy(logits[data['movie'].val_mask], data['movie'].y[data['movie'].val_mask])
+    pbar.set_description(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, Train: {train_acc:.4f}, Val: {val_acc:.4f}')
+    plt.plot(epoch, loss.item(), label='Training loss', color='blue', marker='o')
+    plt.plot(epoch, val_loss, label='Validation loss', color='red', marker='o')
+    plt.plot(epoch, train_acc, label='Training accuracy', color='green', marker='x')
+    plt.plot(epoch, val_acc, label='Validation accuracy', color='yellow', marker='x')
 
-assert sampled_data["movie"].batch_size == 128
+plt.title('Training and validation loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.savefig(f'loss_{lr}.png')
+
+
+from sklearn.metrics import classification_report
+
+print(classification_report(y[data['movie'].test_mask], pred[data['movie'].test_mask]))
 """## Creating a Heterogeneous GNN
 
 We are now ready to create our heterogeneous GNN.
@@ -330,6 +368,7 @@ For defining our heterogenous GNN, we make use of [`nn.SAGEConv`](https://pytorc
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv, to_hetero
 
+hidden_channels = 128
 
 class GNN(torch.nn.Module):
 
@@ -351,13 +390,10 @@ class Model(torch.nn.Module):
 
     def __init__(self, hidden_channels, num_genres):
         super().__init__()
-        # Since the dataset does not come with rich features for the user, we also learn an
-        # embedding matrix for users. For the movies, we use a linear layer to transform
-        # the features into the same dimensionality as the user embeddings.
-        self.user_emb = torch.nn.Embedding(data["user"].num_nodes,
-                                           hidden_channels)
-        self.movie_lin = torch.nn.Linear(data["movie"].x.shape[1],
-                                         hidden_channels)
+
+        # For the movie nodes, we use the pre-computed node features but add a linear layer to reduce the dimensionality.
+        self.movie_lin = torch.nn.Linear(data['movie'].num_features, hidden_channels)
+        self.user_lin = torch.nn.Linear(data['user'].num_features, hidden_channels)
 
         # Instantiate homogeneous GNN:
         self.gnn = GNN(hidden_channels, num_genres)
@@ -365,20 +401,21 @@ class Model(torch.nn.Module):
         # Convert GNN model into a heterogeneous variant:
         self.gnn = to_hetero(self.gnn, metadata=data.metadata())
 
-    def forward(self, data: HeteroData) -> Tensor:
-        x_dict = {
-          "user": self.user_emb(data["user"].node_id),
-          "movie": self.movie_lin(torch.ones_like(data["movie"].x)) # self.movie_lin(data["movie"].x),
-        } 
+    def forward(self, x_dixt, edge_index_dict) -> Tensor:
 
+        # Initialize node embeddings for all node types:
+        x_dict = {
+          "user": self.user_lin(x_dixt["user"]),
+          "movie": self.movie_lin(x_dixt["movie"]),
+        } 
         # `x_dict` holds feature matrices of all node types
         # `edge_index_dict` holds all edge indices of all edge types
-        x = self.gnn(x_dict, data.edge_index_dict)
+        x = self.gnn(x_dict, edge_index_dict)
 
-        # Return the node embeddings for the movie nodes:
+        # We return the logits for each node:
         return x['movie']
 
-model = Model(hidden_channels=8, num_genres=num_genres)
+model = Model(hidden_channels=hidden_channels, num_genres=num_genres)
 
 print(model)
 """## Training a Heterogeneous GNN
@@ -386,7 +423,8 @@ print(model)
 Training our GNN is then similar to training any PyTorch model.
 We move the model to the desired device, and initialize an optimizer that takes care of adjusting model parameters via stochastic gradient descent.
 
-The training loop then iterates over our mini-batches, applies the forward computation of the model, computes the loss from ground-truth labels and obtained predictions, and adjusts model parameters via back-propagation and stochastic gradient descent.
+The training loop applies the forward computation of the model, computes the loss from ground-truth labels and obtained predictions, and adjusts model parameters via back-propagation and stochastic gradient descent.
+
 """
 
 import torch.nn.functional as F
@@ -396,57 +434,57 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: '{device}'")
 
 model = model.to(device)
-for lr in [0.01, 0.005, 0.001]:
-    print(f"Learning rate: {lr}")
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
-for epoch in range(1, 10):
-    pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch:02d}")
-    for batch in pbar:
-        model.train()
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        logits = model(batch)
-        train_logits = logits[:batch['movie'].batch_size]
-        train_y = batch["movie"].y[:batch["movie"].batch_size].argmax(dim=1)
-        loss = F.cross_entropy(train_logits, train_y)
-        loss.backward()
-        optimizer.step()
+# We use Adam as our optimizer with a learning rate scheduler:
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0075) 
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
+def train():
+    model.train()
+    optimizer.zero_grad()
+    logits = model(data.x_dict, data.edge_index_dict)
+    train_logits = logits
+    train_y = data['movie'].y 
+    loss = F.cross_entropy(train_logits, train_y)
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    return loss.item()
+
+def test():
+    model.eval()
     with torch.no_grad():
-        model.eval()
-        logits = model(data.cuda())
-        train_logits = logits[data["movie"].train_mask].argmax(-1)
-        val_logits = logits[data["movie"].val_mask].argmax(-1)
-        test_logits = logits[data["movie"].test_mask].argmax(-1)
-        train_y = data["movie"].y[data["movie"].train_mask].argmax(dim=1)
-        val_y = data["movie"].y[data["movie"].val_mask].argmax(dim=1)
-        test_y = data["movie"].y[data["movie"].test_mask].argmax(dim=1)
+        logits = model(data.x_dict, data.edge_index_dict)
+        test_logits = logits
+        test_y = data['movie'].y
+        return test_logits, test_y
+    
+pbar = tqdm.tqdm(range(1000))
+for epoch in pbar:
+    loss = train()
+    pbar.set_postfix({'loss': f'{loss:.4f}'})
+    scheduler.step()
+    if epoch % 10 == 0:
+        with torch.no_grad():
+            logits, y = test()
+            train_logits = logits[data["movie"].train_mask].argmax(-1)
+            val_logits = logits[data["movie"].val_mask].argmax(-1)
+            train_y = y[data["movie"].train_mask].argmax(dim=1)
+            val_y = y[data["movie"].val_mask].argmax(dim=1)
+            test_y = y[data["movie"].test_mask].argmax(dim=1)
+            print('Train Acc:',
+                (train_logits == train_y).sum().item() / train_y.size(0))
+            print('Val Acc:', (val_logits == val_y).sum().item() / val_y.size(0))
 
-        print('Train Acc:',
-              (train_logits == train_y).sum().item() / train_y.size(0))
-        print('Val Acc:', (val_logits == val_y).sum().item() / val_y.size(0))
-        print('Test Acc:',
-              (test_logits == test_y).sum().item() / test_y.size(0))
-
-        # val_loss = F.cross_entropy(val_logits, val_y)
-        # val_acc = torch.sum(val_logits.argmax(
-        #     dim=1) == val_y).item() / batch["movie"].val_mask.sum().item()
-
-    # print(
-    # f"Epoch: {epoch:03d}, Train Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}"
-    # )
 """## Evaluating a Heterogeneous GNN
 
 After training, we evaluate our model on useen data coming from the test set.
 
 """
 
-from sklearn.metrics import classification_report
-
 with torch.no_grad():
     data.to(device)
-    test_logits = model(data)[data['movie'].test_mask]
+    test_logits = model(data.x_dict, data.edge_index_dict)[data['movie'].test_mask]
     test_y = data['movie'].y[data['movie'].test_mask].argmax(dim=1)
     test_acc = torch.sum(test_logits.argmax(dim=1) == test_y).item() / data['movie'].test_mask.sum().item()
     print(f"Test Accuracy: {test_acc:.4f}")
@@ -455,3 +493,154 @@ with torch.no_grad():
         classification_report(test_y.cpu().numpy(),
                               test_logits.argmax(dim=1).cpu().numpy(),
                               target_names=genres.columns))
+
+
+"""## Explainability with Heterogeneous GNNs"""
+
+# We want to see that the movies with the same genre as the node to be predicted are important for the same prediction. 
+
+from torch_geometric.explain import CaptumExplainer, Explainer
+from captum.attr import IntegratedGradients
+explainer = Explainer(
+    model=model,
+    algorithm=CaptumExplainer(IntegratedGradients),
+    explanation_type='model',
+    model_config=dict(
+        mode='multiclass_classification',
+        task_level='node',
+        return_type='raw',
+    ),
+    node_mask_type='attributes',
+    edge_mask_type='object'
+)
+
+node_index = 11
+y = data['movie'].y[node_index].argmax(dim=0).item()
+print(f"Target label: '{genres.columns[y]}'")
+pred = model(data.x_dict, data.edge_index_dict)[node_index].argmax(dim=0).item()
+print(f"Predicted label: '{genres.columns[pred]}'")
+
+explanation = explainer(data.x_dict, data.edge_index_dict, index=node_index)
+
+# Sum all node feature importances to get the overall importance of each node:
+for node_type in explanation.node_types:
+    explanation[node_type].node_mask = explanation[node_type].node_mask.sum(dim=-1)
+path = 'subgraph.png'
+explanation_homo = explanation.to_homogeneous()
+
+node_index = explanation['user'].num_nodes + node_index
+
+from typing import Optional, Any
+
+def visualize_graph(
+    edge_index: Tensor,
+    edge_weight: Tensor,
+    node_id: int, 
+    node_weight: Optional[Tensor] = None,
+    labels: Optional[Tensor] = None,
+    path: Optional[str] = None,
+) -> Any:
+    import matplotlib.pyplot as plt
+    import networkx as nx
+    from math import sqrt
+
+    g = nx.DiGraph()
+    node_size = 400
+
+    for node in edge_index.view(-1).unique().tolist():
+        g.add_node(node)
+
+    for (src, dst), w in zip(edge_index.t().tolist(), edge_weight.tolist()):
+        if abs(w) > 1e-7:
+            g.add_edge(src, dst, color=w)
+    
+    isolated_nodes = list(nx.isolates(g))
+    if node_id in isolated_nodes:
+        isolated_nodes.remove(node_id)
+    g.remove_nodes_from(isolated_nodes)
+    node_weight = node_weight[list(g.nodes)]
+
+    ax = plt.gca()
+    # use Kamanda kawai layout
+    pos = nx.circular_layout(g)
+
+    # Set color bar
+    vmax = vmin = None
+    if (vmax is None) and (vmin is None):
+        if node_weight is not None:
+            vmax = node_weight.abs().max()
+            vmin = -vmax
+        if edge_weight is not None:
+            edge_max = edge_weight.abs().max()
+            vmax = vmax or 0
+            if edge_max > vmax:
+                vmax = edge_max
+                vmin = -vmax
+
+    import matplotlib as mpl
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    importance_cmap = plt.get_cmap("seismic")
+
+    for src, dst, data in g.edges(data=True):
+        ax.annotate(
+            '',
+            xy=pos[src],
+            xytext=pos[dst],
+            arrowprops=dict(
+                arrowstyle="->",
+                color=importance_cmap(norm(data["color"])),
+                shrinkA=sqrt(node_size) / 2.0,
+                shrinkB=sqrt(node_size) / 2.0,
+                connectionstyle="arc3,rad=0.1",
+            ),
+        )
+
+    if node_weight is not None:
+        node_colors = importance_cmap(norm(node_weight.tolist()))
+    else:
+        node_colors = 'white'
+
+    edgecolors = ['black' if node is not node_id.item() else 'red' for node in g.nodes]
+    nodes = nx.draw_networkx_nodes(g, pos, node_size=node_size,
+                                   node_color=node_colors, margins=0.1, edgecolors=edgecolors)
+
+    if labels is not None:
+        labels = dict(
+            (i, label.item())
+            for i, label in enumerate(labels)
+            if i not in isolated_nodes
+        )
+    else:
+        labels = None
+    nx.draw_networkx_labels(g, pos, font_size=4, labels=labels)
+
+    if path is not None:
+        plt.savefig(path)
+    else:
+        plt.show()
+
+    plt.close()
+
+# Visualize the importance of the entire node as well as the edges 
+# Mark node by node_type and add movie genre as description of node
+# explanation_homo is of type Data including an edge_mask, edge_index, 
+# node_type and edge_type
+
+
+
+# Visualize the explanation subgraph
+from torch_geometric.utils import k_hop_subgraph
+nodes, edge_index, mapping, edge_mask = k_hop_subgraph(node_idx=node_index, num_hops=2, edge_index=explanation_homo.edge_index, relabel_nodes=True)
+
+# Filter out those edge_index where explanation_homo.edge_mask[edge_mask] is 0 
+
+plt.clf()
+
+visualize_graph(edge_index, 
+                explanation_homo.edge_mask[edge_mask], 
+                node_id=mapping,
+                node_weight=explanation_homo.node_mask, 
+                labels=explanation_homo['target'][nodes],
+                path=path)
+
+print(f"Subgraph plot has been saved to '{path}'")

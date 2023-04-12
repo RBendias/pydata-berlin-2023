@@ -8,6 +8,7 @@
 # TODO: Check headlines
 # TODO: Improve hyperparameters
 # TODO: discuss use-case with Matthias
+# TODO: Uncomment asserts
 
 # This notebook runs faster on a GPU.
 # You can enable GPU acceleration by going to Edit -> Notebook Settings -> Hardware Accelerator -> GPU
@@ -139,9 +140,8 @@ movies_df['title'] = movies_df['title'].str.strip()
 
 # Use a CountVectorizer to create a bag-of-words representation of the titles
 from sklearn.feature_extraction.text import CountVectorizer
-
-title_vectorizer = CountVectorizer(stop_words='english', max_features=1000)
-title_vectorizer.fit(movies_df['title'].iloc[train_idx])
+title_vectorizer = CountVectorizer(stop_words='english', analyzer='char_wb', ngram_range=(2, 2)) #, max_features=10000)
+title_vectorizer.fit(movies_df['title'].iloc[train_idx]) 
 title_features = title_vectorizer.transform(movies_df['title'])
 
 # Create binary indicator variables for the year
@@ -162,7 +162,7 @@ tags_df = tags_df.groupby('movieId')['tag'].apply(
 # Merge the tags into the movies data frame
 movies_df = pd.merge(movies_df, tags_df, on='movieId', how='left')
 movies_df['tag'].fillna('', inplace=True)
-tag_vectorizer = CountVectorizer(stop_words='english', max_features=1000)
+tag_vectorizer = CountVectorizer(stop_words='english', analyzer='char_wb', ngram_range=(2, 2)) #, max_features=10000)
 tag_vectorizer.fit(movies_df['tag'].iloc[train_idx])
 tag_features = tag_vectorizer.transform(movies_df['tag'])
 
@@ -295,7 +295,7 @@ train_loader = NeighborLoader(
     num_neighbors={key: [30] * 2
                    for key in data.edge_types},
     # Use a batch size of 128 for sampling training nodes of type paper
-    batch_size=128,
+    batch_size=256,
     input_nodes=('movie', data['movie'].train_mask),
     shuffle=True,
 )
@@ -367,9 +367,9 @@ class Model(torch.nn.Module):
 
     def forward(self, data: HeteroData) -> Tensor:
         x_dict = {
-            "user": self.user_emb(data["user"].node_id),
-            "movie": self.movie_lin(data["movie"].x),
-        }
+          "user": self.user_emb(data["user"].node_id),
+          "movie": self.movie_lin(torch.ones_like(data["movie"].x)) # self.movie_lin(data["movie"].x),
+        } 
 
         # `x_dict` holds feature matrices of all node types
         # `edge_index_dict` holds all edge indices of all edge types
@@ -378,8 +378,7 @@ class Model(torch.nn.Module):
         # Return the node embeddings for the movie nodes:
         return x['movie']
 
-
-model = Model(hidden_channels=8, num_genres=data['movie'].y.shape[1])
+model = Model(hidden_channels=8, num_genres=num_genres)
 
 print(model)
 """## Training a Heterogeneous GNN
@@ -397,7 +396,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: '{device}'")
 
 model = model.to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+for lr in [0.01, 0.005, 0.001]:
+    print(f"Learning rate: {lr}")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
 for epoch in range(1, 10):
     pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch:02d}")
@@ -447,6 +448,8 @@ with torch.no_grad():
     data.to(device)
     test_logits = model(data)[data['movie'].test_mask]
     test_y = data['movie'].y[data['movie'].test_mask].argmax(dim=1)
+    test_acc = torch.sum(test_logits.argmax(dim=1) == test_y).item() / data['movie'].test_mask.sum().item()
+    print(f"Test Accuracy: {test_acc:.4f}")
 
     print(
         classification_report(test_y.cpu().numpy(),

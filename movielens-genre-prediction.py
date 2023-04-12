@@ -6,6 +6,8 @@
 # TODO: Run through Grammarly
 # TODO: Uncomment install commands
 # TODO: Check headlines
+# TODO: Improve hyperparameters
+# TODO: discuss use-case with Matthias
 
 
 # This notebook runs faster on a GPU.
@@ -374,7 +376,7 @@ print(f"Device: '{device}'")
 model = model.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
-for epoch in range(1, 20):
+for epoch in range(1, 10):
     pbar = tqdm.tqdm(loader, desc=f"Epoch {epoch:02d}")
     for batch in pbar:
         model.train()

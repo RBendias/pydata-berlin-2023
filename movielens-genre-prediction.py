@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """PyData Workshop Notebook.ipynb
 """
+# TODO: Run linter on this file
+# TODO: Run through the notebook and make sure it works
+# TODO: Run through Grammarly
+# TODO: Uncomment install commands
+# TODO: Check headlines
+
 
 # This notebook runs faster on a GPU.
 # You can enable GPU acceleration by going to Edit -> Notebook Settings -> Hardware Accelerator -> GPU
@@ -54,7 +60,7 @@ import pandas as pd
 ratings_df = pd.read_csv(ratings_path)
 
 # Load the entire movie data frame into memory:
-movies_df = pd.read_csv(movies_path, index_col='movieId')
+movies_df = pd.read_csv(movies_path)
 
 # Load the entire tags data frame into memory:
 tags_df = pd.read_csv(tags_path)
@@ -66,12 +72,12 @@ print(f"Number of movies: {len(movies_df)}")
 print()
 print('ratings.csv:')
 print('============')
-print(tags_df[["userId", "movieId", "rating"]].head())
+print(ratings_df[["userId", "movieId", "rating"]].head())
 print(f"Number of ratings: {len(ratings_df)}")
 print()
 print('tags.csv:')
 print('============')
-print(ratings_df[['userId','movieId','tag']].head())
+print(tags_df[['userId','movieId','tag']].head())
 print(f"Number of tags: {len(tags_df)}")
 
 """We are going to use the `genres` column in the `movie.csv` as the target of our node prediction task. 
@@ -88,7 +94,7 @@ movies_df = movies_df[movies_df['genres'].str.contains('|'.join(popular_genres))
 
 # Filter out movies that are assigned to more than one popular genre:
 genres = movies_df['genres'].str.get_dummies('|')
-movies_df = movies_df[genres[popular_genres].sum(axis=1) == 1]
+movies_df = movies_df[genres[popular_genres].sum(axis=1) == 1].reset_index(drop=True)
 
 # Split genres and convert into indicator variables:
 genres = movies_df['genres'].str.get_dummies('|')
@@ -105,7 +111,7 @@ from sklearn.model_selection import train_test_split
 num_movies = len(movies_df)
 
 # Next, split the indices of the nodes into train, validation, and test sets using `train_test_split`
-train_idx, valtest_idx = train_test_split(num_movies, train_size=0.8, test_size=0.2, random_state=42)
+train_idx, valtest_idx = train_test_split(range(num_movies), train_size=0.8, test_size=0.2, random_state=42)
 val_idx, test_idx = train_test_split(valtest_idx, train_size=0.5, test_size=0.5, random_state=42)
 
 """After preparing the target column and the split we can look at the data again and prepare the features for every movie.
@@ -128,7 +134,7 @@ movies_df['title'] = movies_df['title'].str.strip()
 # Use a CountVectorizer to create a bag-of-words representation of the titles
 from sklearn.feature_extraction.text import CountVectorizer
 title_vectorizer = CountVectorizer(stop_words='english', max_features=1000)
-title_vectorizer.fit(movies_df['title'][train_idx]) 
+title_vectorizer.fit(movies_df['title'].iloc[train_idx]) 
 title_features = title_vectorizer.transform(movies_df['title'])
 
 # Create binary indicator variables for the year
@@ -141,16 +147,16 @@ movie_feat = np.concatenate((title_features.toarray(), year_indicator), axis=1)
 Similar to the title, we are using a bag-of-words representation of the tags. Finally, we combine the tag features with the title and year features into a single feature matrix for every movie."""
 
 # Filter out tags that do not belong to the movies in the training set
-print(f"Number of tags that do not belong to the movies in the training set: {len(tags_df[~tags_df['movieId'].isin(movies_df.index)])}")
 tags_df = tags_df[tags_df['movieId'].isin(movies_df.index)]
 tags_df = tags_df[tags_df['tag'].notna()]
 tags_df = tags_df.groupby('movieId')['tag'].apply(lambda x: ' '.join(x)).reset_index('movieId')
 
 # Merge the tags into the movies data frame
-movies_df = movies_df.join(tags_df, on='movieId')
+movies_df = pd.merge(movies_df, tags_df, on='movieId', how='left')
+movies_df['tag'].fillna('', inplace=True)
 tag_vectorizer = CountVectorizer(stop_words='english', max_features=1000)
-tag_vectorizer.fit(movies_df['tag'][train_idx])
-tag_features = tag_vectorizer.transform(movies_df['tag'].fillna(''))
+tag_vectorizer.fit(movies_df['tag'].iloc[train_idx])
+tag_features = tag_vectorizer.transform(movies_df['tag'])
 
 # Combine all movie features into a single feature matrix
 movie_feat = np.concatenate((movie_feat, tag_features.toarray()), axis=1)
@@ -163,6 +169,9 @@ This is needed as we want our final data representation to be as compact as poss
 
 Afterwards, we obtain the final `edge_index` representation of shape `[2, num_ratings]` from `ratings.csv` by merging mapped user and movie indices with the raw indices given by the original data frame.
 """
+
+# Filter ratings to only include movies in movies_df
+ratings_df = ratings_df[ratings_df['movieId'].isin(movies_df.index)]
 
 # Create a mapping from unique user indices to range [0, num_user_nodes):
 unique_user_id = ratings_df['userId'].unique()
@@ -177,8 +186,8 @@ print()
 # Create a mapping from unique movie indices to range [0, num_movie_nodes):
 unique_movie_id = ratings_df['movieId'].unique()
 unique_movie_id = pd.DataFrame(data={
-    'movieId': movies_df.index,
-    'mappedID': pd.RangeIndex(len(movies_df)),
+    'movieId': unique_movie_id,
+    'mappedID': pd.RangeIndex(len(unique_movie_id)),
 })
 print("Mapping of movie IDs to consecutive values:")
 print("===========================================")
@@ -363,10 +372,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: '{device}'")
 
 model = model.to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
 for epoch in range(1, 20):
-    for batch in tqdm.tqdm(loader):
+    pbar = tqdm.tqdm(loader, desc=f"Epoch {epoch:02d}")
+    for batch in pbar:
         model.train()
         batch = batch.to(device)
         optimizer.zero_grad()
@@ -377,15 +387,16 @@ for epoch in range(1, 20):
         train_acc = torch.sum(train_logits.argmax(dim=1) == train_y).item() / batch["movie"].train_mask.sum().item()
         loss.backward()
         optimizer.step()
+        pbar.set_postfix({"loss": loss.item(), "acc": train_acc})
 
-        model.eval()
-        logits = model(batch)
-        val_logits = logits[batch["movie"].val_mask]
-        val_y = batch["movie"].y[batch["movie"].val_mask].argmax(dim=1)
-        val_loss = F.cross_entropy(val_logits, val_y)
-        val_acc = torch.sum(val_logits.argmax(dim=1) == val_y).item() / batch["movie"].val_mask.sum().item()
+    model.eval()
+    logits = model(batch)
+    val_logits = logits[batch["movie"].val_mask]
+    val_y = batch["movie"].y[batch["movie"].val_mask].argmax(dim=1)
+    val_loss = F.cross_entropy(val_logits, val_y)
+    val_acc = torch.sum(val_logits.argmax(dim=1) == val_y).item() / batch["movie"].val_mask.sum().item()
         
-        print(f"Epoch: {epoch:03d}, Train Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+    print(f"Epoch: {epoch:03d}, Train Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
 
     
 """## Evaluating a Heterogeneous GNN
